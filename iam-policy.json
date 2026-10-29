@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RBUIReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+        "rds:DescribeGlobalClusters",
+        "rds:DescribeDBClusterSnapshots",
+        "rds:DescribeDBSnapshots",
+        "rds:DescribeAccountAttributes",
+        "rds:DescribeDBProxies",
+        "kms:DescribeKey",
+        "kms:ListAliases",
+        "service-quotas:GetServiceQuota",
+        "service-quotas:ListServiceQuotas",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
