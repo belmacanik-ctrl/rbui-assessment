@@ -141,11 +141,21 @@ check_failover_timing() {
 
   # FT-07 — Aurora clusters without readers
   while IFS= read -r cluster; do
-    cid=$(echo "$cluster"     | jq -r '.DBClusterIdentifier')
-    engine=$(echo "$cluster"  | jq -r '.Engine')
-    members=$(echo "$cluster" | jq '[.DBClusterMembers[] | select(.IsClusterWriter==false)] | length')
+    cid=$(echo "$cluster"    | jq -r '.DBClusterIdentifier')
+    engine=$(echo "$cluster" | jq -r '.Engine')
+    # Count reader instances — handle null/empty DBClusterMembers safely
+    members=$(echo "$cluster" | jq '(.DBClusterMembers // []) | [.[] | select(.IsClusterWriter==false)] | length')
+    members=${members:-0}
+    # Match all Aurora engine variants: aurora, aurora-mysql, aurora-postgresql
     if [[ "$engine" == aurora* ]] && [[ "$members" -eq 0 ]]; then
-      blocker "FT-07" CRITICAL "Aurora cluster '$cid' has NO readers — failover has no target, RTO: 10-15 minutes"
+      # Double-check: also count total members to distinguish "no instances" vs "writer only"
+      total=$(echo "$cluster" | jq '(.DBClusterMembers // []) | length')
+      total=${total:-0}
+      if [[ "$total" -eq 0 ]]; then
+        blocker "FT-07" CRITICAL "Aurora cluster '$cid' (engine: $engine) has NO instances at all — cluster is empty, RTO undefined"
+      else
+        blocker "FT-07" CRITICAL "Aurora cluster '$cid' (engine: $engine) has ONE writer and NO readers — failover has no target, RTO: 10-15 minutes"
+      fi
     fi
   done < <(echo "$RDS_CLUSTERS" | jq -c '.[]')
 
