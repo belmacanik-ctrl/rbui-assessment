@@ -140,22 +140,35 @@ check_failover_timing() {
   blocker "FT-06" HIGH "JVM default DNS TTL can be INFINITE — Java apps using this DB may never reconnect after failover. Verify networkaddress.cache.ttl=60 in all Java clients."
 
   # FT-07 — Aurora clusters without readers
+  # ROOT CAUSE FIX: DBClusterMembers[] is empty ([]) in describe-db-clusters
+  # even when instances exist. We cross-reference describe-db-instances instead,
+  # matching on DBClusterIdentifier. Aurora readers have a non-null
+  # ReadReplicaSourceDBInstanceIdentifier; writers do not.
   while IFS= read -r cluster; do
     cid=$(echo "$cluster"    | jq -r '.DBClusterIdentifier')
     engine=$(echo "$cluster" | jq -r '.Engine')
-    # Count reader instances — handle null/empty DBClusterMembers safely
-    members=$(echo "$cluster" | jq '(.DBClusterMembers // []) | [.[] | select(.IsClusterWriter==false)] | length')
-    members=${members:-0}
-    # Match all Aurora engine variants: aurora, aurora-mysql, aurora-postgresql
-    if [[ "$engine" == aurora* ]] && [[ "$members" -eq 0 ]]; then
-      # Double-check: also count total members to distinguish "no instances" vs "writer only"
-      total=$(echo "$cluster" | jq '(.DBClusterMembers // []) | length')
-      total=${total:-0}
-      if [[ "$total" -eq 0 ]]; then
-        blocker "FT-07" CRITICAL "Aurora cluster '$cid' (engine: $engine) has NO instances at all — cluster is empty, RTO undefined"
-      else
-        blocker "FT-07" CRITICAL "Aurora cluster '$cid' (engine: $engine) has ONE writer and NO readers — failover has no target, RTO: 10-15 minutes"
-      fi
+
+    if [[ "$engine" != aurora* ]]; then
+      continue
+    fi
+
+    # Count all instances belonging to this cluster via describe-db-instances
+    total=$(echo "$RDS_INSTANCES" | jq --arg cid "$cid" \
+      '[.[] | select(.DBClusterIdentifier==$cid)] | length')
+    total=${total:-0}
+
+    # Count readers: Aurora reader instances have a non-empty
+    # ReadReplicaSourceDBInstanceIdentifier field
+    readers=$(echo "$RDS_INSTANCES" | jq --arg cid "$cid" \
+      '[.[] | select(.DBClusterIdentifier==$cid)
+             | select((.ReadReplicaSourceDBInstanceIdentifier // "") != "")
+        ] | length')
+    readers=${readers:-0}
+
+    if [[ "$total" -eq 0 ]]; then
+      blocker "FT-07" CRITICAL "Aurora cluster '$cid' ($engine) has NO instances — cluster is empty, RTO: undefined"
+    elif [[ "$readers" -eq 0 ]]; then
+      blocker "FT-07" CRITICAL "Aurora cluster '$cid' ($engine) has $total instance(s), all writers, NO readers — no failover target, RTO: 10-15 minutes"
     fi
   done < <(echo "$RDS_CLUSTERS" | jq -c '.[]')
 
