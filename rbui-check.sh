@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-# rbui-check.sh — RDS/Aurora Resilience Blocker Assessment v1.1.0
+# rbui-check.sh — RDS/Aurora Resilience Blocker Assessment
 # Converted from: https://github.com/aws-samples/sample-kiro-rbui-agent
 # Output: HTML report (rbui-report-YYYYMMDD-HHMMSS.html)
-# Read-only: uses only describe/list/get AWS API calls
+# Read-only: uses only describe/list/get AWS API calls (+ optional DNS lookups)
+#
+# Usage: rbui-check [REGION] [DR_REGION]
+#   REGION     region to assess (default: us-east-1)
+#   DR_REGION  optional target DR region; enables KMS readiness checks (EN-03)
+#
+# Severity model:
+#   CRITICAL/HIGH/MEDIUM/LOW  findings derived from your account data (counted)
+#   INFO                      data-derived informational items
+#   ADVISORY                  generic best-practice reminders that the script
+#                             CANNOT verify from AWS APIs -- not counted in the
+#                             verdict; verify manually
+# Compatible with bash 3.2+ (macOS default) -- no associative arrays.
 # =============================================================================
 
 # NOTE: Do NOT use set -e — arithmetic like VAR=$((VAR+1)) is safe but
@@ -11,12 +23,27 @@
 set -uo pipefail
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
+RBUI_VERSION="1.3.0"
 AWS_REGION="${1:-us-east-1}"
+DR_REGION="${2:-${RBUI_DR_REGION:-}}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTPUT_HTML="rbui-report-${TIMESTAMP}.html"
+ACCOUNT_ID="UNKNOWN"
 
 # Severity counters
-CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0; INFO_COUNT=0
+CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0; INFO_COUNT=0; ADVISORY_COUNT=0
+
+# KMS key cache: newline-separated "arn|KeyManager|MultiRegion" (bash 3.2 safe)
+KMS_CACHE=""
+KMS_MANAGER=""; KMS_MULTI=""; DRK_STATUS=""; DRK_DETAIL=""
+
+# Temp files: API stderr capture + list of failed API calls
+RBUI_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/rbui_err.XXXXXX")
+RBUI_FAILED_FILE=$(mktemp "${TMPDIR:-/tmp}/rbui_failed.XXXXXX")
+trap 'rm -f "$RBUI_ERR_FILE" "$RBUI_FAILED_FILE"' EXIT
+
+# api_failed LABEL -> true if that collection call failed
+api_failed() { grep -qxF "$1" "$RBUI_FAILED_FILE" 2>/dev/null; }
 
 # Terminal colours
 RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
@@ -69,6 +96,7 @@ tr:last-child td{border-bottom:none;}
 .MEDIUM  {color:var(--m);background:var(--mb);}
 .LOW     {color:var(--l);background:var(--lb);}
 .INFO    {color:var(--i);background:var(--ib);}
+.ADVISORY{color:#6c5b7b;background:#f5f0fa;}
 .OK      {color:var(--l);background:var(--lb);}
 tr.CRITICAL td{background:var(--cb);}
 tr.HIGH     td{background:var(--hb);}
@@ -84,6 +112,7 @@ tr.MEDIUM   td{background:var(--mb);}
 .sm{color:var(--m);background:var(--mb);}
 .sl{color:var(--l);background:var(--lb);}
 .si{color:var(--i);background:var(--ib);}
+.sa{color:#6c5b7b;background:#f5f0fa;}
 .verdict{margin:0 16px 16px;padding:12px 16px;border-radius:6px;
          font-weight:600;font-size:.95em;}
 .vc{background:var(--cb);color:var(--c);border-left:4px solid var(--c);}
@@ -97,8 +126,8 @@ HTMLHEAD
 
 html_meta() {
   printf '<h1>&#x1F6E1; RBUI &mdash; RDS/Aurora Resilience Blocker Assessment</h1>\n' >> "$OUTPUT_HTML"
-  printf '<div class="meta">Account: <strong>%s</strong> &nbsp;|&nbsp; Region: <strong>%s</strong> &nbsp;|&nbsp; Generated: <strong>%s</strong></div>\n' \
-    "$1" "$AWS_REGION" "$(date)" >> "$OUTPUT_HTML"
+  printf '<div class="meta">Account: <strong>%s</strong> &nbsp;|&nbsp; Region: <strong>%s</strong> &nbsp;|&nbsp; DR region: <strong>%s</strong> &nbsp;|&nbsp; Generated: <strong>%s</strong></div>\n' \
+    "$1" "$AWS_REGION" "${DR_REGION:-not specified}" "$(date)" >> "$OUTPUT_HTML"
 }
 
 html_toc() {
@@ -143,7 +172,7 @@ html_ok_row() {
 }
 
 html_summary() {
-  local c="$1" h="$2" m="$3" l="$4" i="$5"
+  local c="$1" h="$2" m="$3" l="$4" i="$5" a="$6"
   local vcls vtxt
   if   [[ "$c" -gt 0 ]]; then vcls="vc";  vtxt="&#x26A0; CRITICAL BLOCKERS FOUND — DR is broken or severely limited. Address P1 items immediately."
   elif [[ "$h" -gt 0 ]]; then vcls="vh";  vtxt="&#x26A0; HIGH-SEVERITY BLOCKERS — DR paths exist but are unreliable. Address P2 items this week."
@@ -165,8 +194,10 @@ html_summary() {
   <div class="sb sm">$m<span>Medium</span></div>
   <div class="sb sl">$l<span>Low</span></div>
   <div class="sb si">$i<span>Info</span></div>
+  <div class="sb sa">$a<span>Advisory</span></div>
 </div>
 <div class="verdict $vcls">$vtxt</div>
+<p style="margin:0 16px 16px;color:#6c5b7b;font-size:.85em">ADVISORY items are generic best-practice reminders that cannot be verified from AWS APIs. They are not counted in the verdict &mdash; verify them manually.</p>
 <table>
 <tr><th>Priority</th><th>When</th><th>Focus</th></tr>
 <tr><td><strong>P1 &mdash; Immediate</strong></td><td>Today</td><td>All CRITICAL items</td></tr>
@@ -177,7 +208,7 @@ SUMHTML
 }
 
 html_close() {
-  printf '<footer>RBUI v1.1.0 &nbsp;|&nbsp; Read-only assessment &nbsp;|&nbsp; Based on <a href="https://github.com/aws-samples/sample-kiro-rbui-agent">aws-samples/sample-kiro-rbui-agent</a></footer>\n</body></html>\n' >> "$OUTPUT_HTML"
+  printf '<footer>RBUI v%s &nbsp;|&nbsp; Read-only assessment &nbsp;|&nbsp; Based on <a href="https://github.com/aws-samples/sample-kiro-rbui-agent">aws-samples/sample-kiro-rbui-agent</a></footer>\n</body></html>\n' "$RBUI_VERSION" >> "$OUTPUT_HTML"
 }
 
 # =============================================================================
@@ -201,9 +232,72 @@ blocker() {
     MEDIUM)   MEDIUM=$((MEDIUM+1));         colour="${CYAN}";   label="[MEDIUM  ]" ;;
     LOW)      LOW=$((LOW+1));               colour="${GREEN}";  label="[LOW     ]" ;;
     INFO)     INFO_COUNT=$((INFO_COUNT+1)); colour="${RESET}";  label="[INFO    ]" ;;
+    ADVISORY) ADVISORY_COUNT=$((ADVISORY_COUNT+1)); colour="${RESET}"; label="[ADVISORY]" ;;
   esac
   log "  ${colour}${label} ${BOLD}${id}${RESET} -- ${msg}"
   html_row "$sev" "$id" "$msg"
+}
+
+# Generic, unverifiable reminder -- not counted in the verdict
+advisory() { blocker "$1" ADVISORY "$2"; }
+
+# dns_ttl HOST -> prints the TTL (seconds) of the first answer record, or "" if
+# dig is unavailable / lookup fails. Note: a caching resolver returns the
+# REMAINING TTL, so the value can be lower than the authoritative TTL.
+dns_ttl() {
+  local host="$1" ttl=""
+  [[ -z "$host" || "$host" == "null" ]] && { echo ""; return; }
+  command -v dig &>/dev/null || { echo ""; return; }
+  ttl=$(dig +noall +answer +time=2 +tries=1 "$host" 2>/dev/null | awk 'NR==1{print $2}')
+  [[ "$ttl" =~ ^[0-9]+$ ]] && echo "$ttl" || echo ""
+}
+
+# kms_key_info KEY_ARN -> sets KMS_MANAGER (AWS/CUSTOMER/UNKNOWN) and
+# KMS_MULTI (true/false/UNKNOWN). Must be called directly (not via $(...))
+# so the cache in KMS_CACHE persists between calls.
+kms_key_info() {
+  local key="$1" hit out region
+  hit=$(printf '%s\n' "$KMS_CACHE" | grep -F "${key}|" | head -1)
+  if [[ -n "$hit" ]]; then
+    out="${hit#"${key}|"}"
+    KMS_MANAGER="${out%%|*}"; KMS_MULTI="${out#*|}"
+    return
+  fi
+  # Key ARNs are arn:aws:kms:<region>:<acct>:key/<id>; query the key's own region
+  region=$(echo "$key" | awk -F: '{print $4}'); region=${region:-$AWS_REGION}
+  out=$(aws kms describe-key --key-id "$key" --region "$region" \
+          --query 'KeyMetadata.[KeyManager,MultiRegion]' --output text 2>/dev/null \
+        | awk '{print $1"|"tolower($2)}')
+  [[ -z "$out" || "$out" == "|" ]] && out="UNKNOWN|UNKNOWN"
+  KMS_CACHE="${KMS_CACHE}${key}|${out}"$'\n'
+  KMS_MANAGER="${out%%|*}"; KMS_MULTI="${out#*|}"
+}
+
+# kms_dr_key_check KEY_ARN MULTIREGION -> sets DRK_STATUS (OK/MISSING/UNKNOWN)
+# and DRK_DETAIL describing key readiness in $DR_REGION.
+kms_dr_key_check() {
+  local key="$1" multi="$2" replica cmk_count
+  DRK_STATUS="UNKNOWN"; DRK_DETAIL=""
+  if [[ "$multi" == "true" ]]; then
+    # Multi-Region key: replica in DR region shares the same key id
+    replica=$(echo "$key" | awk -F: -v r="$DR_REGION" 'BEGIN{OFS=":"}{$4=r; print}')
+    if aws kms describe-key --key-id "$replica" --region "$DR_REGION" &>/dev/null; then
+      DRK_STATUS="OK";      DRK_DETAIL="multi-Region key replica exists in $DR_REGION"
+    else
+      DRK_STATUS="MISSING"; DRK_DETAIL="multi-Region key is NOT replicated to $DR_REGION (or DescribeKey denied)"
+    fi
+    return
+  fi
+  # Single-Region CMK: need any customer-managed key aliased in the DR region
+  cmk_count=$(aws kms list-aliases --region "$DR_REGION" --output json 2>/dev/null \
+    | jq '[.Aliases[] | select(.TargetKeyId != null) | select(.AliasName | startswith("alias/aws/") | not)] | length' 2>/dev/null)
+  if [[ -z "$cmk_count" ]]; then
+    DRK_STATUS="UNKNOWN"; DRK_DETAIL="could not list KMS aliases in $DR_REGION (permission?)"
+  elif [[ "$cmk_count" -gt 0 ]]; then
+    DRK_STATUS="OK";      DRK_DETAIL="$cmk_count customer-managed key alias(es) found in $DR_REGION -- confirm one is designated for RDS DR copies"
+  else
+    DRK_STATUS="MISSING"; DRK_DETAIL="NO customer-managed key alias found in $DR_REGION"
+  fi
 }
 
 ok() {
@@ -222,15 +316,21 @@ check_prereqs() {
       echo "ERROR: '$cmd' is required but not installed." >&2; exit 1
     fi
   done
-  local acct
-  acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "UNKNOWN")
-  log "Account : $acct"
-  log "Region  : $AWS_REGION"
-  log "Report  : $OUTPUT_HTML"
-  if [[ "$acct" == "UNKNOWN" ]]; then
-    echo "ERROR: AWS credentials invalid. Run 'aws sts get-caller-identity'." >&2; exit 1
+  # Called directly (not in a subshell) so 'exit 1' really stops the script
+  # and the log lines below reach the terminal instead of a variable.
+  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "UNKNOWN")
+  [[ -z "$ACCOUNT_ID" ]] && ACCOUNT_ID="UNKNOWN"
+  if [[ "$ACCOUNT_ID" == "UNKNOWN" ]]; then
+    echo "ERROR: AWS credentials invalid. Run 'aws sts get-caller-identity'." >&2
+    rm -f "$OUTPUT_HTML"; exit 1
   fi
-  echo "$acct"
+  log "  Account   : $ACCOUNT_ID"
+  log "  Region    : $AWS_REGION"
+  log "  DR region : ${DR_REGION:-not specified (pass as 2nd arg to enable KMS DR checks)}"
+  log "  Report    : $OUTPUT_HTML"
+  if ! command -v dig &>/dev/null; then
+    log "  ${YELLOW}[WARN]${RESET} 'dig' not found -- DNS TTLs will not be measured (FT-04/FT-05 become ADVISORY)"
+  fi
 }
 
 # =============================================================================
@@ -240,13 +340,17 @@ collect_data() {
   html_section_open "collect" "Data Collection"
   header "Collecting RDS/Aurora topology..."
 
+  # _aws runs inside $(...), so failures are recorded in a file (a variable
+  # set in the subshell would be lost); checks consult it via api_failed.
   _aws() {
     local label="$1"; shift
     local out
-    out=$(aws "$@" --output json 2>/tmp/rbui_err) || {
-      local err; err=$(cat /tmp/rbui_err | head -1)
-      log "  ${YELLOW}[WARN]${RESET} $label failed: $err"
-      html_row "HIGH" "API" "$label failed: $err"
+    out=$(aws "$@" --output json 2>"$RBUI_ERR_FILE") || {
+      echo "$label" >> "$RBUI_FAILED_FILE"
+      local err; err=$(head -1 "$RBUI_ERR_FILE")
+      # Warning goes to stderr: stdout is captured as JSON by the caller
+      log "  ${YELLOW}[WARN]${RESET} $label failed: $err" >&2
+      html_row "HIGH" "API" "$label failed: $err -- related checks are INCOMPLETE"
       echo "[]"; return
     }
     echo "$out"
@@ -254,7 +358,7 @@ collect_data() {
 
   RDS_INSTANCES=$(_aws "describe-db-instances"     rds describe-db-instances     --region "$AWS_REGION" --query 'DBInstances[*]')
   RDS_CLUSTERS=$(_aws  "describe-db-clusters"      rds describe-db-clusters      --region "$AWS_REGION" --query 'DBClusters[*]')
-  GLOBAL_CLUSTERS=$(_aws "describe-global-clusters" rds describe-global-clusters --query 'GlobalClusters[*]')
+  GLOBAL_CLUSTERS=$(_aws "describe-global-clusters" rds describe-global-clusters --region "$AWS_REGION" --query 'GlobalClusters[*]')
   CLUSTER_SNAPSHOTS=$(_aws "describe-db-cluster-snapshots" rds describe-db-cluster-snapshots --region "$AWS_REGION" --snapshot-type manual --query 'DBClusterSnapshots[*]')
   INSTANCE_SNAPSHOTS=$(_aws "describe-db-snapshots"  rds describe-db-snapshots   --region "$AWS_REGION" --snapshot-type manual --query 'DBSnapshots[*]')
   PROXIES=$(_aws "describe-db-proxies"               rds describe-db-proxies     --region "$AWS_REGION" --query 'DBProxies[*]')
@@ -293,52 +397,98 @@ check_failover_timing() {
     fi
   done < <(echo "$RDS_INSTANCES" | jq -c '.[]' 2>/dev/null)
 
+  # FT-03 / FT-05: only meaningful for non-Aurora RDS instances that CAN fail
+  # over (Multi-AZ). Single-AZ instances are already covered by FT-09.
+  local ft03_ids=""
   while IFS= read -r inst; do
-    local id cls
-    id=$(jqr "$inst" -r '.DBInstanceIdentifier'); [[ -z "$id" ]] && continue
-    cls=$(jqr "$inst" -r '.DBInstanceClass')
-    blocker "FT-03" MEDIUM "Instance '$id' ($cls): large open transactions extend failover beyond 120s -- monitor long-running transactions"
-  done < <(echo "$RDS_INSTANCES" | jq -c '.[]' 2>/dev/null)
-
-  while IFS= read -r inst; do
-    local id engine
+    local id engine maz addr ttl
     id=$(jqr "$inst" -r '.DBInstanceIdentifier'); [[ -z "$id" ]] && continue
     engine=$(jqr "$inst" -r '.Engine')
-    if [[ "$engine" == aurora* ]]; then
-      blocker "FT-04" MEDIUM "Aurora instance '$id': DNS TTL=5s but client-side caching can extend stale routing window"
+    maz=$(jqr "$inst" -r '.MultiAZ')
+    [[ "$engine" == aurora* || "$maz" != "true" ]] && continue
+    ft03_ids="${ft03_ids:+$ft03_ids, }$id"
+
+    addr=$(jqr "$inst" -r '.Endpoint.Address // ""')
+    ttl=$(dns_ttl "$addr")
+    if [[ -n "$ttl" ]]; then
+      blocker "FT-05" MEDIUM "RDS instance '$id': endpoint DNS TTL measured at ${ttl}s ($addr) -- clients may route to the old primary for up to ${ttl}s after failover (resolver-cached values can read lower than the authoritative TTL)"
     else
-      blocker "FT-05" MEDIUM "RDS instance '$id': CNAME TTL=60s -- 60s stale routing window after failover"
+      advisory "FT-05" "RDS instance '$id': endpoint DNS TTL NOT measured (dig unavailable or lookup failed) -- run 'dig +noall +answer $addr' to verify the stale-routing window"
     fi
   done < <(echo "$RDS_INSTANCES" | jq -c '.[]' 2>/dev/null)
 
-  blocker "FT-06" HIGH "JVM DNS TTL defaults to INFINITE -- Java apps may never reconnect after Aurora failover. Set networkaddress.cache.ttl=60 in java.security."
+  [[ -n "$ft03_ids" ]] && advisory "FT-03" "Multi-AZ RDS instance(s) [$ft03_ids]: long-running/large open transactions extend crash recovery and failover beyond the typical 60-120s -- NOT measured; check pg_stat_activity (xact_start) at peak load"
 
-  # FT-07: Two-stage reader detection
-  # Stage 1: use DBClusterMembers if non-empty (IsClusterWriter is reliable)
-  # Stage 2: fall back to describe-db-instances cross-reference
+  # FT-04: Aurora cluster (writer) endpoint TTL, measured per cluster with instances
   while IFS= read -r cluster; do
-    local cid engine members_len readers total writers
+    local cid engine ep ttl n
+    cid=$(jqr "$cluster" -r '.DBClusterIdentifier'); [[ -z "$cid" ]] && continue
+    engine=$(jqr "$cluster" -r '.Engine');           [[ "$engine" != aurora* ]] && continue
+    n=$(echo "$cluster" | jq '(.DBClusterMembers // []) | length' 2>/dev/null || echo 0)
+    [[ "$n" -eq 0 ]] && continue
+    ep=$(jqr "$cluster" -r '.Endpoint // ""')
+    ttl=$(dns_ttl "$ep")
+    if [[ -n "$ttl" ]]; then
+      if [[ "$ttl" -gt 5 ]]; then
+        blocker "FT-04" MEDIUM "Aurora cluster '$cid': writer endpoint DNS TTL measured at ${ttl}s ($ep) -- higher than the expected 5s; stale routing window after failover is at least ${ttl}s"
+      else
+        advisory "FT-04" "Aurora cluster '$cid': writer endpoint DNS TTL measured at ${ttl}s -- OK at DNS level, but client/OS/driver DNS caching can still extend the stale routing window"
+      fi
+    else
+      advisory "FT-04" "Aurora cluster '$cid': writer endpoint DNS TTL NOT measured -- run 'dig +noall +answer $ep' (expected 5s)"
+    fi
+  done < <(echo "$RDS_CLUSTERS" | jq -c '.[]' 2>/dev/null)
+
+  # FT-06: cannot be checked from AWS APIs -- application host setting
+  advisory "FT-06" "Java clients: JVM DNS caching is INFINITE only when a SecurityManager is installed; otherwise the OpenJDK default is ~30s. NOT verifiable from AWS APIs -- check networkaddress.cache.ttl in java.security and -Dsun.net.inetaddr.ttl / -Djava.security.manager on app hosts; set an explicit TTL <=60s"
+
+  # FT-07 / FT-10: reader presence and AZ placement.
+  # DBClusterMembers[].IsClusterWriter is authoritative. If DBClusterMembers is
+  # empty but describe-db-instances lists instances for the cluster, roles can't
+  # be determined reliably (ReadReplicaSourceDBInstanceIdentifier is NOT set on
+  # Aurora readers), so report UNVERIFIED instead of a false CRITICAL.
+  while IFS= read -r cluster; do
+    local cid engine members_len readers total inst_total evidence writer_az other_az_readers
     cid=$(jqr "$cluster" -r '.DBClusterIdentifier');    [[ -z "$cid" ]]  && continue
     engine=$(jqr "$cluster" -r '.Engine');              [[ "$engine" != aurora* ]] && continue
 
     members_len=$(echo "$cluster" | jq '(.DBClusterMembers // []) | length' 2>/dev/null || echo 0)
+    inst_total=$(echo "$RDS_INSTANCES" | jq --arg c "$cid" '[.[] | select(.DBClusterIdentifier == $c)] | length' 2>/dev/null || echo 0)
 
-    if [[ "$members_len" -gt 0 ]]; then
-      readers=$(echo "$cluster" | jq '[(.DBClusterMembers // [])[] | select(.IsClusterWriter == false)] | length' 2>/dev/null || echo 0)
-      total=$members_len
-    else
-      total=$(echo "$RDS_INSTANCES" | jq --arg c "$cid" '[.[] | select(.DBClusterIdentifier == $c)] | length' 2>/dev/null || echo 0)
-      writers=$(echo "$RDS_INSTANCES" | jq --arg c "$cid" \
-        '[.[] | select(.DBClusterIdentifier == $c) | select((.ReadReplicaSourceDBInstanceIdentifier // "") == "")] | length' \
-        2>/dev/null || echo 0)
-      readers=$((total - writers))
-      [[ $readers -lt 0 ]] && readers=0
+    if [[ "$members_len" -eq 0 && "$inst_total" -eq 0 ]]; then
+      blocker "FT-07" CRITICAL "Aurora cluster '$cid' ($engine): NO instances (DBClusterMembers empty, no instances in describe-db-instances) -- cluster has no compute, RTO undefined until an instance is added"
+      continue
+    fi
+    if [[ "$members_len" -eq 0 ]]; then
+      blocker "FT-07" MEDIUM "Aurora cluster '$cid' ($engine): $inst_total instance(s) found but DBClusterMembers is empty -- reader/writer roles UNVERIFIED; check with 'aws rds describe-db-clusters --db-cluster-identifier $cid'"
+      continue
     fi
 
-    if [[ "$total" -eq 0 ]]; then
-      blocker "FT-07" CRITICAL "Aurora cluster '$cid' ($engine): NO instances found -- cluster is empty, RTO: undefined"
-    elif [[ "$readers" -eq 0 ]]; then
-      blocker "FT-07" CRITICAL "Aurora cluster '$cid' ($engine): $total instance(s) present, all writers, NO readers -- no failover target, RTO: 10-15 minutes"
+    total=$members_len
+    readers=$(echo "$cluster" | jq '[.DBClusterMembers[] | select(.IsClusterWriter == false)] | length' 2>/dev/null || echo 0)
+
+    # Evidence: "id (writer|reader, az)" for each member, AZ from describe-db-instances
+    evidence=$(jq -rn --argjson c "$cluster" --argjson i "$RDS_INSTANCES" '
+      ($i | map({key: .DBInstanceIdentifier, value: (.AvailabilityZone // "?")}) | from_entries) as $az
+      | [$c.DBClusterMembers[] | "\(.DBInstanceIdentifier) (\(if .IsClusterWriter then "writer" else "reader" end), \($az[.DBInstanceIdentifier] // "?"))"]
+      | join(", ")' 2>/dev/null || echo "?")
+
+    if [[ "$readers" -eq 0 ]]; then
+      blocker "FT-07" CRITICAL "Aurora cluster '$cid' ($engine): NO readers -- members: $evidence. No failover target: on writer failure Aurora recreates the instance best-effort (typically ~10 min, not guaranteed during an AZ outage). Add a reader in a different AZ."
+      continue
+    fi
+
+    # FT-10: at least one reader must be outside the writer's AZ
+    writer_az=$(jq -rn --argjson c "$cluster" --argjson i "$RDS_INSTANCES" '
+      ([$c.DBClusterMembers[] | select(.IsClusterWriter) | .DBInstanceIdentifier][0]) as $w
+      | ([$i[] | select(.DBInstanceIdentifier == $w) | .AvailabilityZone][0] // "")' 2>/dev/null || echo "")
+    other_az_readers=$(jq -rn --argjson c "$cluster" --argjson i "$RDS_INSTANCES" --arg waz "$writer_az" '
+      [$c.DBClusterMembers[] | select(.IsClusterWriter == false) | .DBInstanceIdentifier] as $r
+      | [$i[] | select(.DBInstanceIdentifier as $x | $r | index($x)) | select(.AvailabilityZone != $waz)] | length' 2>/dev/null || echo 0)
+    if [[ -n "$writer_az" && "$other_az_readers" -eq 0 ]]; then
+      blocker "FT-10" HIGH "Aurora cluster '$cid': all $readers reader(s) are in the writer's AZ ($writer_az) -- members: $evidence. Instance failure is covered, AZ failure is NOT."
+    else
+      ok "Aurora cluster '$cid': $readers reader(s), at least one outside the writer AZ -- members: $evidence"
     fi
   done < <(echo "$RDS_CLUSTERS" | jq -c '.[]' 2>/dev/null)
 
@@ -357,8 +507,8 @@ check_snapshot_restore() {
   html_section_open "sr" "Category 2: Snapshot Restore Constraints (SR)"
   header "Category 2: Snapshot Restore Constraints (SR)"
 
-  blocker "SR-01" MEDIUM "Snapshot restore uses lazy loading from S3 -- 'available' does NOT mean performant. Pre-warm with pg_prewarm after restore."
-  blocker "SR-03" HIGH   "Snapshot restore ALWAYS creates a NEW instance -- existing endpoints will NOT point to it. Update connection strings post-restore."
+  advisory "SR-01" "Snapshot restore uses lazy loading from S3 -- 'available' does NOT mean performant. Pre-warm (e.g. pg_prewarm) after restore."
+  advisory "SR-03" "Snapshot restore ALWAYS creates a NEW instance/cluster -- existing endpoints will NOT point to it. Plan DNS/connection-string cutover in the runbook."
 
   while IFS= read -r snap; do
     local snapid
@@ -372,20 +522,30 @@ check_snapshot_restore() {
     blocker "SR-05" MEDIUM "Instance snapshot '$snapid': restore assigns DEFAULT parameter group -- custom tuning is lost"
   done < <(echo "$INSTANCE_SNAPSHOTS" | jq -c '.[]' 2>/dev/null)
 
-  blocker "SR-06" HIGH "Restored instances get DEFAULT security group -- DB may be unreachable. Apply correct SG immediately after restore."
+  advisory "SR-06" "Restores without explicit --vpc-security-group-ids get the DEFAULT security group -- DB may be unreachable. Specify SGs in the restore command."
 
+  local sr07_ids="" sr08_ids=""
   while IFS= read -r cluster; do
-    local cid engine pitr
+    local cid engine pitr members_len
     cid=$(jqr "$cluster" -r '.DBClusterIdentifier');    [[ -z "$cid" ]] && continue
     engine=$(jqr "$cluster" -r '.Engine')
     pitr=$(jqr "$cluster" -r '.BackupRetentionPeriod')
-    [[ "$engine" == aurora* ]] && blocker "SR-07" MEDIUM "Aurora cluster '$cid': PITR restores cluster only -- reader instances must be re-added separately (+5-10 min each)"
-    [[ "$pitr" -gt 0 ]] 2>/dev/null && blocker "SR-08" MEDIUM "Cluster '$cid': PITR transaction logs flushed every 5 min -- minimum achievable RPO is 5 minutes"
+    # Empty clusters are already CRITICAL under FT-07; PITR notes aren't actionable
+    members_len=$(echo "$cluster" | jq '(.DBClusterMembers // []) | length' 2>/dev/null || echo 0)
+    [[ "$members_len" -eq 0 ]] && continue
+    [[ "$engine" == aurora* ]] && sr07_ids="${sr07_ids:+$sr07_ids, }$cid"
+    [[ "$pitr" -gt 0 ]] 2>/dev/null && sr08_ids="${sr08_ids:+$sr08_ids, }$cid"
   done < <(echo "$RDS_CLUSTERS" | jq -c '.[]' 2>/dev/null)
+  [[ -n "$sr07_ids" ]] && advisory "SR-07" "Aurora cluster(s) [$sr07_ids]: PITR/snapshot restore creates the cluster only -- writer and reader instances must be added separately (+5-10 min each)"
+  [[ -n "$sr08_ids" ]] && advisory "SR-08" "Cluster(s) [$sr08_ids]: PITR latest restorable time typically lags ~5 min -- plan for RPO of minutes when restoring from backups"
 
   while IFS= read -r inst; do
-    local id storage
+    local id storage engine
     id=$(jqr "$inst" -r '.DBInstanceIdentifier'); [[ -z "$id" ]] && continue
+    engine=$(jqr "$inst" -r '.Engine')
+    # Aurora AllocatedStorage is a placeholder (1) -- cluster volume size isn't
+    # exposed here, so a storage-based RTO estimate would be misleading
+    [[ "$engine" == aurora* ]] && continue
     storage=$(jqr "$inst" -r '.AllocatedStorage'); storage=${storage:-0}
     if   [[ "$storage" -gt 500 ]]; then blocker "SR-10" INFO "Instance '$id' (${storage}GB): snapshot restore RTO ~60-180 min"
     elif [[ "$storage" -gt 100 ]]; then blocker "SR-10" INFO "Instance '$id' (${storage}GB): snapshot restore RTO ~30-60 min"
@@ -401,39 +561,56 @@ check_encryption() {
   html_section_open "en" "Category 3: Encryption Constraints (EN)"
   header "Category 3: Encryption Constraints (EN)"
 
-  while IFS= read -r inst; do
-    local id enc engine kms
-    id=$(jqr "$inst" -r '.DBInstanceIdentifier');   [[ -z "$id" ]] && continue
-    enc=$(jqr "$inst" -r '.StorageEncrypted')
-    engine=$(jqr "$inst" -r '.Engine')
-    kms=$(jqr "$inst" -r '.KmsKeyId // ""')
-    [[ "$engine" == aurora* ]] && continue
-    if [[ "$enc" == "false" ]]; then
-      blocker "EN-01" HIGH "RDS instance '$id' is UNENCRYPTED -- encryption requires snapshot-encrypt-restore migration"
-      blocker "EN-04" HIGH "RDS instance '$id' is UNENCRYPTED -- cross-region replicas are BLOCKED until encrypted"
-    elif echo "$kms" | grep -q "aws/rds"; then
-      blocker "EN-05" MEDIUM "RDS instance '$id' uses AWS-managed key (aws/rds) -- cross-account snapshot copy BLOCKED. Migrate to CMK."
-      blocker "EN-03" MEDIUM "RDS instance '$id': cross-region copies require pre-provisioned CMK in destination region"
-    else
-      blocker "EN-03" MEDIUM "RDS instance '$id': cross-region snapshot copies require re-encryption with destination CMK"
-    fi
-  done < <(echo "$RDS_INSTANCES" | jq -c '.[]' 2>/dev/null)
+  # Non-Aurora instances that are not members of a cluster, then all clusters.
+  # Aurora instances inherit encryption from their cluster, so they're skipped.
+  local resources
+  resources=$( {
+    echo "$RDS_INSTANCES" | jq -r '.[] | select((.Engine | startswith("aurora")) | not) | select(.DBClusterIdentifier == null)
+      | ["RDS instance", .DBInstanceIdentifier, (.StorageEncrypted|tostring), (.KmsKeyId // "")] | @tsv' 2>/dev/null
+    echo "$RDS_CLUSTERS"  | jq -r '.[]
+      | [(if (.Engine | startswith("aurora")) then "Aurora cluster" else "DB cluster" end), .DBClusterIdentifier, (.StorageEncrypted|tostring), (.KmsKeyId // "")] | @tsv' 2>/dev/null
+  } )
 
-  while IFS= read -r cluster; do
-    local cid enc kms
-    cid=$(jqr "$cluster" -r '.DBClusterIdentifier'); [[ -z "$cid" ]] && continue
-    enc=$(jqr "$cluster" -r '.StorageEncrypted')
-    kms=$(jqr "$cluster" -r '.KmsKeyId // ""')
-    if [[ "$enc" == "false" ]]; then
-      blocker "EN-01" HIGH "Aurora cluster '$cid' is UNENCRYPTED -- Global DB and cross-region replicas are BLOCKED"
-      blocker "EN-04" HIGH "Aurora cluster '$cid' is UNENCRYPTED -- ALL cross-region DR paths are BLOCKED"
-    elif echo "$kms" | grep -q "aws/rds"; then
-      blocker "EN-05" MEDIUM "Aurora cluster '$cid' uses AWS-managed key -- cross-account snapshot copy BLOCKED. Migrate to CMK."
-      blocker "EN-03" MEDIUM "Aurora cluster '$cid': cross-region snapshot copies require pre-provisioned CMK in destination region"
-    else
-      blocker "EN-03" MEDIUM "Aurora cluster '$cid': cross-region snapshot copies require re-encryption with destination CMK"
+  while IFS=$'\t' read -r kind rid enc kms; do
+    [[ -z "${rid:-}" ]] && continue
+    if [[ "$enc" != "true" ]]; then
+      # One finding per resource (previously EN-01 + EN-04 double-counted).
+      # Per AWS docs, unencrypted sources produce unencrypted snapshots/replicas
+      # and encryption can't be enabled in place -- it does not by itself block
+      # cross-region replication, but fixing it later forces a migration.
+      blocker "EN-01" HIGH "$kind '$rid' is UNENCRYPTED -- encryption cannot be enabled in place; its snapshots and replicas (incl. DR copies) stay unencrypted. Fix requires restore with a KMS key or blue/green (new endpoint)."
+      continue
     fi
-  done < <(echo "$RDS_CLUSTERS" | jq -c '.[]' 2>/dev/null)
+
+    if [[ -z "$kms" || "$kms" == "null" ]]; then
+      # Encrypted but no KmsKeyId exposed -> likely AWS-owned key (Aurora default since 2026-02-18)
+      blocker "EN-05" MEDIUM "$kind '$rid' is encrypted but exposes no KmsKeyId (likely the AWS-owned default key) -- key policy cannot be managed; verify cross-account snapshot sharing and cross-region copy behavior before relying on it for DR"
+      continue
+    fi
+
+    kms_key_info "$kms"
+    case "$KMS_MANAGER" in
+      AWS)
+        blocker "EN-05" HIGH "$kind '$rid' uses the AWS-managed key aws/rds ($kms) -- snapshots CANNOT be shared cross-account (blocks cross-account DR/backup vault). Migrate: copy snapshot with a CMK and restore."
+        ;;
+      CUSTOMER)
+        local ktype="single-Region CMK"; [[ "$KMS_MULTI" == "true" ]] && ktype="multi-Region CMK"
+        if [[ -z "$DR_REGION" ]]; then
+          advisory "EN-03" "$kind '$rid' uses a $ktype ($kms). Cross-region snapshot copy must name a key in the destination region -- pass a DR region as 2nd argument to verify readiness."
+        else
+          kms_dr_key_check "$kms" "$KMS_MULTI"
+          case "$DRK_STATUS" in
+            OK)      ok "$kind '$rid' ($ktype): $DRK_DETAIL" ;;
+            MISSING) blocker "EN-03" HIGH   "$kind '$rid' ($ktype, $kms): $DRK_DETAIL -- cross-region snapshot copy/restore to $DR_REGION has no CMK to re-encrypt with" ;;
+            *)       blocker "EN-03" MEDIUM "$kind '$rid' ($ktype): $DRK_DETAIL -- DR key readiness UNVERIFIED" ;;
+          esac
+        fi
+        ;;
+      *)
+        blocker "EN-05" MEDIUM "$kind '$rid': could not describe KMS key ($kms) -- kms:DescribeKey denied or key in another account. Key type (AWS-managed vs CMK) UNVERIFIED."
+        ;;
+    esac
+  done <<< "$resources"
 
   while IFS= read -r gc; do
     local gcid
@@ -449,12 +626,16 @@ check_kms_throttling() {
   html_section_open "kt" "Category 4: KMS API Throttling (KT)"
   header "Category 4: KMS API Throttling (KT)"
 
+  # Count encrypted resources the same way as Category 3: standalone non-Aurora
+  # instances + all clusters (Aurora instances share their cluster's key)
   local enc_count
-  enc_count=$(echo "$RDS_INSTANCES" | jq '[.[] | select(.StorageEncrypted==true)] | length' 2>/dev/null || echo 0)
-  blocker "KT-01" MEDIUM "KMS symmetric ops quota: ${KMS_QUOTA} req/s shared across $enc_count encrypted instances -- parallel restores compete for this quota"
-  blocker "KT-02" HIGH   "KMS quota is SHARED across ALL services (RDS, S3, EBS, Lambda) on the same key -- DR-time contention is likely"
-  blocker "KT-03" HIGH   "Exceeding KMS quota returns ThrottlingException -- parallel encrypted restores may stall silently during DR"
-  blocker "KT-04" HIGH   "KMS CreateGrant quota: 50 req/s -- each RDS encrypted operation consumes one grant. Fleet restores will bottleneck here."
+  enc_count=$(jq -n --argjson i "$RDS_INSTANCES" --argjson c "$RDS_CLUSTERS" '
+    ([$i[] | select((.Engine | startswith("aurora")) | not) | select(.DBClusterIdentifier == null) | select(.StorageEncrypted == true)] | length)
+    + ([$c[] | select(.StorageEncrypted == true)] | length)' 2>/dev/null || echo 0)
+  advisory "KT-01" "KMS cryptographic ops quota in $AWS_REGION: ${KMS_QUOTA} req/s, shared by $enc_count encrypted RDS/Aurora resource(s) -- parallel restores compete for this quota"
+  advisory "KT-02" "KMS request quotas are per account+region and SHARED across all services (RDS, S3, EBS, Lambda) -- DR-time contention possible; not measurable from config"
+  advisory "KT-03" "Exceeding KMS quotas returns ThrottlingException -- test parallel encrypted restores in a DR drill to confirm they don't stall"
+  advisory "KT-04" "KMS CreateGrant is rate-limited -- encrypted RDS creates/restores consume grants; stagger fleet-wide restores in the runbook"
 }
 
 # =============================================================================
@@ -509,6 +690,9 @@ check_application_layer() {
   local proxy_count
   proxy_count=$(echo "$PROXIES" | jq 'length' 2>/dev/null || echo 0)
 
+  if api_failed "describe-db-proxies"; then
+    blocker "AL-01" MEDIUM "RDS Proxy presence UNVERIFIED -- describe-db-proxies failed (see API row above). Grant rds:DescribeDBProxies and re-run."
+  else
   while IFS= read -r cluster; do
     local cid has_proxy
     cid=$(jqr "$cluster" -r '.DBClusterIdentifier'); [[ -z "$cid" ]] && continue
@@ -518,9 +702,10 @@ check_application_layer() {
     [[ "$has_proxy" == "false" ]] && \
       blocker "AL-01" HIGH "Cluster '$cid' has NO RDS Proxy -- failover relies on DNS (5-60s stale routing). Deploy RDS Proxy or AWS JDBC Wrapper."
   done < <(echo "$RDS_CLUSTERS" | jq -c '.[]' 2>/dev/null)
+  fi
 
-  blocker "AL-02" HIGH   "Connection pools hold stale connections after failover -- errors until pool cycles. Configure connection validation and short pool TTL."
-  blocker "AL-03" MEDIUM "TCP keepalive defaults are 2+ hours -- dead connections take minutes to detect. Set tcp_keepalive_time=60 on DB clients."
+  advisory "AL-02" "Connection pools can hold stale connections after failover -- NOT verifiable from AWS APIs; configure connection validation and a short max lifetime"
+  advisory "AL-03" "OS TCP keepalive defaults are ~2 hours -- dead connections are detected slowly. NOT verifiable from AWS APIs; set client keepalive (e.g. 60s) on app hosts"
 
   [[ "$proxy_count" -gt 0 ]] && \
     blocker "AL-04" MEDIUM "RDS Proxy detected ($proxy_count): after Global DB failover, Proxy in old primary region still points to demoted instance -- update targets."
@@ -532,8 +717,7 @@ check_application_layer() {
     [[ "$engine" == aurora-postgresql* ]] && \
       blocker "AL-06" MEDIUM "Global cluster '$gcid' (PostgreSQL): Cluster Cache Management NOT supported on secondary -- cold buffer pool after failover"
   done < <(echo "$GLOBAL_CLUSTERS" | jq -c '.[]' 2>/dev/null)
-
-  blocker "FT-06" MEDIUM "Verify all Java clients: networkaddress.cache.ttl=60 -- default JVM DNS TTL is INFINITE, preventing reconnection after failover."
+  # FT-06 is reported once, in Category 1 (previously duplicated here)
 }
 
 # =============================================================================
@@ -562,12 +746,12 @@ check_account_quotas() {
   if [[ "$CLUSTER_COUNT"  -ge 36 ]]; then blocker "QT-04" CRITICAL "DB clusters: $CLUSTER_COUNT/40 -- approaching regional limit."
   else ok "DB clusters: $CLUSTER_COUNT/40"; fi
 
-  blocker "QT-07" HIGH "Concurrent cross-region snapshot copies: hard limit is 5. Multiple simultaneous DR copies will queue and delay recovery."
+  advisory "QT-07" "Concurrent cross-region snapshot copies are limited (5 per destination region) -- multiple simultaneous DR copies queue and delay recovery"
 
   if [[ "$gc_count"     -ge 5  ]]; then blocker "QT-10" MEDIUM "Aurora Global Databases: $gc_count/5 -- at regional limit."
   else ok "Aurora Global Databases: $gc_count/5"; fi
 
-  blocker "QT-15" HIGH "KMS CreateGrant quota: 50 req/s -- fleet-wide encrypted restores will bottleneck here."
+  # QT-15 (KMS CreateGrant) is covered by KT-04 -- not reported twice
 
   if [[ "$proxy_count"  -ge 18 ]]; then blocker "QT-19" MEDIUM "RDS Proxies: $proxy_count/20 -- approaching limit."
   else ok "RDS Proxies: $proxy_count/20"; fi
@@ -588,15 +772,14 @@ print_summary() {
   log "  ${CYAN}MEDIUM   : $MEDIUM${RESET}"
   log "  ${GREEN}LOW      : $LOW${RESET}"
   log "  INFO     : $INFO_COUNT"
+  log "  ADVISORY : $ADVISORY_COUNT  (generic, unverifiable from AWS APIs -- not counted in verdict)"
   log ""
   if   [[ "$CRITICAL" -gt 0 ]]; then log "  ${RED}${BOLD}VERDICT: CRITICAL BLOCKERS FOUND -- DR is broken or severely limited${RESET}"
   elif [[ "$HIGH"     -gt 0 ]]; then log "  ${YELLOW}${BOLD}VERDICT: HIGH-SEVERITY BLOCKERS -- DR paths exist but are unreliable${RESET}"
   elif [[ "$MEDIUM"   -gt 0 ]]; then log "  ${CYAN}VERDICT: MEDIUM ISSUES -- DR possible but recovery times degraded${RESET}"
   else                               log "  ${GREEN}${BOLD}VERDICT: No blockers found${RESET}"; fi
-  log ""
-  log "  HTML report: $OUTPUT_HTML"
 
-  html_summary "$CRITICAL" "$HIGH" "$MEDIUM" "$LOW" "$INFO_COUNT"
+  html_summary "$CRITICAL" "$HIGH" "$MEDIUM" "$LOW" "$INFO_COUNT" "$ADVISORY_COUNT"
   html_close
 }
 
@@ -606,13 +789,12 @@ print_summary() {
 main() {
   html_init
   log "================================================================"
-  log "  RBUI -- RDS/Aurora Resilience Blocker Assessment v1.1.0"
+  log "  RBUI -- RDS/Aurora Resilience Blocker Assessment v${RBUI_VERSION}"
   log "  $(date)"
   log "================================================================"
 
-  local acct
-  acct=$(check_prereqs)
-  html_meta "$acct"
+  check_prereqs
+  html_meta "$ACCOUNT_ID"
   html_toc
 
   collect_data

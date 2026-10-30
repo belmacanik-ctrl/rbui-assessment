@@ -1,6 +1,6 @@
 # RBUI — RDS/Aurora Resilience Blocker Assessment Tool
 
-**Version:** 1.0.0  
+**Version:** 1.3.0  
 **Converted from:** https://github.com/aws-samples/sample-kiro-rbui-agent  
 **License:** MIT-0
 
@@ -29,7 +29,14 @@ No agents, no special runtimes, no Kiro CLI required. Just `aws` + `jq`.
 | 6 | Application Layer (AL) | 6 | JVM DNS cache can be infinite — never reconnects |
 | 7 | Account Quotas (QT) | 20 | Only 5 concurrent cross-region snapshot copies allowed |
 
-Severity levels: **CRITICAL → HIGH → MEDIUM → LOW → INFO**
+Severity levels: **CRITICAL → HIGH → MEDIUM → LOW → INFO**, plus **ADVISORY**.
+
+- **CRITICAL / HIGH / MEDIUM / LOW / INFO** — derived from your account data
+  (describe/list API output, measured DNS TTLs, KMS key metadata). These are
+  counted in the verdict and include the evidence that triggered them.
+- **ADVISORY** — generic best-practice reminders the script **cannot verify**
+  from AWS APIs (JVM DNS cache, connection pools, TCP keepalive, KMS quota
+  contention, restore behaviour). Not counted in the verdict — verify manually.
 
 ---
 
@@ -42,6 +49,9 @@ aws --version
 
 # jq (JSON processor)
 jq --version
+# dig (optional) -- measures endpoint DNS TTLs for FT-04/FT-05.
+# Without it those checks are reported as ADVISORY (not measured).
+dig -v   # Amazon Linux: sudo yum install -y bind-utils
 
 # Install jq if missing:
 # Ubuntu/Debian
@@ -107,6 +117,9 @@ rbui-check ca-central-1
 rbui-check eu-west-1
 rbui-check ap-southeast-1
 
+# Assess a region AND verify KMS readiness in a target DR region (EN-03)
+rbui-check eu-west-1 eu-central-1
+# (equivalent: RBUI_DR_REGION=eu-central-1 rbui-check eu-west-1)
 # Save output to a custom file
 rbui-check us-east-1 | tee my-audit.txt
 
@@ -121,7 +134,7 @@ for region in us-east-1 us-west-2 eu-west-1 ap-southeast-1; do
 
 The script produces:
 - **Colour-coded terminal output** (CRITICAL=red, HIGH=yellow, MEDIUM=cyan)
-- **A timestamped report file** `rbui-report-YYYYMMDD-HHMMSS.txt` in the
+- **A timestamped HTML report** `rbui-report-YYYYMMDD-HHMMSS.html` in the
   current directory
 - **A verdict** at the end with remediation priority (P1/P2/P3)
 
@@ -130,9 +143,9 @@ The script produces:
 ══════════════════════════════════════════════
   Category 1: Failover Timing (FT)
 ══════════════════════════════════════════════
-  [CRITICAL] FT-07 — Aurora cluster 'prod-cluster' has NO readers — RTO: 10-15 min
-  [HIGH    ] FT-06 — JVM DNS TTL can be INFINITE — Java apps may never reconnect
-  [MEDIUM  ] FT-04 — Aurora DNS TTL=5s but client-side caching extends stale routing
+  [CRITICAL] FT-07 -- Aurora cluster 'prod' (aurora-postgresql): NO readers -- members: prod-1 (writer, eu-west-1a). ...
+  [MEDIUM  ] FT-05 -- RDS instance 'db1': endpoint DNS TTL measured at 60s (...)
+  [ADVISORY] FT-06 -- Java clients: JVM DNS caching is INFINITE only when a SecurityManager is installed ...
 
 ══════════════════════════════════════════════
   ASSESSMENT SUMMARY
@@ -157,8 +170,31 @@ The script produces:
 | Priority | When | Focus |
 |----------|------|-------|
 | P1 — Immediate | Today | CRITICAL: FT-07, FT-09, CR-05, QT-03, QT-04, EN-06 |
-| P2 — This week | 1-7 days | HIGH: EN-01, EN-04, CR-01, AL-01, AL-02 |
-| P3 — 30 days | This month | MEDIUM: SR-05, SR-08, KT-01, CR-14 |
+| P2 — This week | 1-7 days | HIGH: FT-10, EN-01, EN-03 (DR key missing), EN-05 (aws/rds key), CR-01, AL-01 |
+| P3 — 30 days | This month | MEDIUM: FT-04/FT-05 (measured TTL), SR-05, CR-14 |
+| Review | Any time | ADVISORY items — verify manually, not counted |
+
+## Changelog
+
+**1.3.0**
+- New `ADVISORY` severity for generic, unverifiable items (FT-03, FT-06, KT-*,
+  SR-01/03/06/07/08, AL-02/03, QT-07); excluded from the verdict.
+- FT-03/FT-05 only for Multi-AZ non-Aurora instances; FT-05/FT-04 now measure
+  endpoint DNS TTL with `dig` instead of hard-coded values.
+- FT-06 reported once (was duplicated in Category 6); wording corrected
+  (infinite caching only with a SecurityManager).
+- FT-07 shows member/role/AZ evidence; no longer infers Aurora readers from
+  `ReadReplicaSourceDBInstanceIdentifier` (false CRITICALs). New FT-10: all
+  readers in the writer's AZ.
+- EN-03/EN-05 resolve the key via `kms:DescribeKey` (the old `aws/rds` string
+  match never matched a key ARN). AWS-managed key -> EN-05 HIGH. Optional DR
+  region argument checks CMK / multi-Region replica readiness. EN-01/EN-04
+  merged into one finding with accurate wording.
+- Fixed: account/region header lines were swallowed into a variable and bad
+  credentials didn't stop the run; API warnings corrupted collected JSON;
+  failed `describe-db-proxies` produced false "NO RDS Proxy" findings;
+  `describe-global-clusters` ignored the region argument; QT-15 duplicated KT-04;
+  SR-10 no longer uses Aurora's placeholder `AllocatedStorage`.
 
 ---
 
