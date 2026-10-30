@@ -15,9 +15,13 @@ warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 success() { echo -e "${GREEN}${BOLD}[OK]${RESET}    $*"; }
 
+# Version comes from the script itself so the installer never goes stale
+RBUI_VER=$(grep -m1 '^RBUI_VERSION=' "$SCRIPT_SRC" 2>/dev/null | cut -d'"' -f2 || true)
+RBUI_VER=${RBUI_VER:-unknown}
+
 echo ""
 echo -e "${BOLD}RBUI — RDS/Aurora Resilience Blocker Assessment Tool${RESET}"
-echo -e "${BOLD}Installer v1.0.0${RESET}"
+echo -e "${BOLD}Installer for rbui-check v${RBUI_VER}${RESET}"
 echo "================================================================"
 echo ""
 
@@ -46,6 +50,13 @@ else
   JQ_VER=$(jq --version)
   success "jq found: $JQ_VER"
 fi
+# dig is optional: used to measure endpoint DNS TTLs (FT-04/FT-05)
+if command -v dig &>/dev/null; then
+  success "dig found (DNS TTLs will be measured)"
+else
+  warn "dig not found -- FT-04/FT-05 will be reported as ADVISORY (not measured)."
+  warn "  Amazon Linux/RHEL: sudo yum install -y bind-utils   Debian/Ubuntu: sudo apt-get install -y dnsutils"
+fi
 
 # ── Check source script exists ─────────────────────────────────────────────
 if [[ ! -f "$SCRIPT_SRC" ]]; then
@@ -68,7 +79,8 @@ success "Installed: $INSTALL_DIR/$SCRIPT_NAME"
 
 # ── Verify install ─────────────────────────────────────────────────────────
 if command -v "$SCRIPT_NAME" &>/dev/null; then
-  success "Verified: 'rbui-check' is available system-wide"
+  INSTALLED_VER=$(grep -m1 '^RBUI_VERSION=' "$(command -v "$SCRIPT_NAME")" 2>/dev/null | cut -d'"' -f2 || true)
+  success "Verified: 'rbui-check' v${INSTALLED_VER:-unknown} is available system-wide"
 else
   warn "'rbui-check' not found in PATH after install — you may need to run: export PATH=\$PATH:$INSTALL_DIR"
 fi
@@ -90,6 +102,18 @@ echo "    aws iam attach-user-policy \\"
 echo "      --user-name YOUR_USER \\"
 echo "      --policy-arn arn:aws:iam::ACCOUNT_ID:policy/RBUI-ReadOnly"
 echo ""
+echo -e "  ${YELLOW}${BOLD}UPGRADING from v1.3.0 or earlier?${RESET} The policy changed -- v1.3.1+ needs"
+echo "  service-quotas:ListAWSDefaultServiceQuotas. Update the EXISTING policy:"
+echo ""
+echo "    aws iam create-policy-version \\"
+echo "      --policy-arn arn:aws:iam::ACCOUNT_ID:policy/RBUI-ReadOnly \\"
+echo "      --policy-document file://iam-policy.json \\"
+echo "      --set-as-default"
+echo ""
+echo "  (IAM keeps max 5 versions -- delete an old one first if this fails:"
+echo "   aws iam list-policy-versions --policy-arn ...  /  aws iam delete-policy-version ...)"
+echo "  Without it, quota limits are reported as 'UNVERIFIED default'."
+echo ""
 
 # ── Usage ──────────────────────────────────────────────────────────────────
 echo "================================================================"
@@ -99,6 +123,7 @@ echo ""
 echo "  rbui-check                    # assess us-east-1 (default)"
 echo "  rbui-check ca-central-1       # assess specific region"
 echo "  rbui-check eu-west-1          # assess another region"
+echo "  rbui-check eu-west-1 eu-central-1   # + verify KMS readiness in DR region"
 echo ""
 echo "  For multiple regions:"
 echo "    for r in us-east-1 eu-west-1 ap-southeast-1; do"

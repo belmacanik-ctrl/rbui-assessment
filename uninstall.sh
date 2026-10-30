@@ -25,13 +25,18 @@ else
   echo -e "${RED}[SKIP]${RESET} $TARGET not found — already removed or never installed"
 fi
 
-# Clean up any report files in current directory
-REPORTS=$(ls rbui-report-*.txt 2>/dev/null | wc -l | tr -d ' ')
+# Clean up any report files in current directory (.html since v1.2.0; .txt from older versions)
+# nullglob: unmatched patterns expand to nothing (an 'ls' on a missing glob
+# would fail and, under set -euo pipefail, silently abort the uninstaller)
+shopt -s nullglob
+REPORT_FILES=(rbui-report-*.html rbui-report-*.txt)
+shopt -u nullglob
+REPORTS=${#REPORT_FILES[@]}
 if [[ "$REPORTS" -gt 0 ]]; then
   echo ""
-  read -rp "Remove $REPORTS report file(s) from current directory? [y/N] " confirm
+  read -rp "Remove $REPORTS report file(s) from current directory? [y/N] " confirm || confirm=""
   if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    rm -f rbui-report-*.txt
+    rm -f -- "${REPORT_FILES[@]}"
     echo -e "${GREEN}[OK]${RESET} Report files removed"
   fi
 fi

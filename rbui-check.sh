@@ -23,7 +23,7 @@
 set -uo pipefail
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-RBUI_VERSION="1.3.1"
+RBUI_VERSION="1.3.2"
 AWS_REGION="${1:-us-east-1}"
 DR_REGION="${2:-${RBUI_DR_REGION:-}}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)

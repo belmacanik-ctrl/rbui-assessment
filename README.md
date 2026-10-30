@@ -1,6 +1,6 @@
 # RBUI — RDS/Aurora Resilience Blocker Assessment Tool
 
-**Version:** 1.3.1  
+**Version:** 1.3.2  
 **Converted from:** https://github.com/aws-samples/sample-kiro-rbui-agent  
 **License:** MIT-0
 
@@ -86,14 +86,52 @@ aws iam create-policy \
   --policy-document file://iam-policy.json
 ```
 
+> ⚠️ **Upgrading from v1.3.0 or earlier — update the IAM policy in AWS.**
+> v1.3.1+ also needs `service-quotas:ListAWSDefaultServiceQuotas` (already in
+> `iam-policy.json`). Pulling the new code does **not** change the policy that
+> is attached in your account — publish a new version of it:
+>
+> ```bash
+> aws iam create-policy-version \
+>   --policy-arn arn:aws:iam::ACCOUNT_ID:policy/RBUI-ReadOnly \
+>   --policy-document file://iam-policy.json \
+>   --set-as-default
+> ```
+>
+> IAM keeps at most 5 versions per policy. If the command fails with
+> `LimitExceeded`, remove an old one first:
+> `aws iam list-policy-versions --policy-arn ...` then
+> `aws iam delete-policy-version --policy-arn ... --version-id v1`.
+> Without this permission the script still runs, but quota limits it cannot
+> read are reported as `UNVERIFIED default`.
+
 ---
 
 ## Installation
+
+### Get the code
+```bash
+# First time
+git clone https://github.com/belmacanik-ctrl/rbui-assessment.git rbui-package
+cd rbui-package
+
+# Upgrade an existing clone
+git -C rbui-package pull
+```
+Alternatively, unzip the release package `rbui-assessment-vX.Y.Z.zip` from
+this repo (it contains the same files under `rbui-package/`). If your
+`rbui-package/` folder came from a zip, it is not a git repo — remove it and
+clone instead of pulling.
+
+After upgrading, re-run `./install.sh` (the installed copy in
+`/usr/local/bin` is not updated automatically) and check the
+**IAM policy upgrade note** above.
 
 ### Option A — Run the installer
 ```bash
 chmod +x install.sh
 ./install.sh
+grep -m1 '^RBUI_VERSION=' /usr/local/bin/rbui-check   # confirm installed version
 ```
 This copies `rbui-check.sh` to `/usr/local/bin/rbui-check` and makes it
 executable system-wide.
@@ -176,6 +214,17 @@ The script produces:
 
 ## Changelog
 
+**1.3.2** (packaging/docs — no assessment logic changes)
+- README + installer: IAM policy upgrade steps (`create-policy-version`) for
+  the `service-quotas:ListAWSDefaultServiceQuotas` permission added in 1.3.1.
+- README: install/upgrade via `git clone` / `git pull`, troubleshooting for
+  UNVERIFIED quotas, missing `dig`, KMS DescribeKey, stale installed copy.
+- install.sh: shows the real script version, checks for optional `dig`,
+  verifies the installed version, DR-region usage example.
+- uninstall.sh: cleans up `.html` reports (was only `.txt`), and no longer
+  aborts silently before "Uninstall complete" when no report files exist.
+- `.gitignore` for `.DS_Store` and generated reports; `.DS_Store` untracked.
+
 **1.3.1**
 - Category 7 (QT) now uses your account's real limits instead of hard-coded
   defaults. Resolution order: `rds describe-account-attributes` (real Used +
@@ -234,8 +283,9 @@ rbui-package/
 ├── README.md          ← this file
 ├── rbui-check.sh      ← main assessment script
 ├── install.sh         ← system-wide installer
-├── uninstall.sh       ← removes installed files
-└── iam-policy.json    ← read-only IAM policy to attach
+├── uninstall.sh       ← removes installed files (and optionally reports)
+├── iam-policy.json    ← read-only IAM policy to attach
+└── rbui-assessment-vX.Y.Z.zip  ← release package of the files above
 ```
 
 ---
@@ -249,6 +299,11 @@ rbui-package/
 | `UnauthorizedOperation` errors | Attach `iam-policy.json` to your IAM identity |
 | Empty results | Check `aws configure` and region name |
 | `NoCredentialProviders` | Set `AWS_PROFILE` or attach an IAM role |
+| `[WARN] list-aws-default-service-quotas ... AccessDenied` / quotas shown as `UNVERIFIED default` | Update the IAM policy in AWS (see **IAM policy upgrade note**) |
+| `[WARN] 'dig' not found` / FT-04, FT-05 shown as ADVISORY | Install `bind-utils` (Amazon Linux/RHEL) or `dnsutils` (Debian/Ubuntu) |
+| EN-05 `could not describe KMS key` | Grant `kms:DescribeKey` (in `iam-policy.json`); keys in another account can't be described |
+| Old version still runs after `git pull` | Re-run `./install.sh` — `/usr/local/bin/rbui-check` is a copy |
+| `git pull` fails: not a git repository | Folder came from a zip — remove it and `git clone` |
 
 ---
 
