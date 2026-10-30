@@ -1,6 +1,6 @@
 # RBUI — RDS/Aurora Resilience Blocker Assessment Tool
 
-**Version:** 1.3.0  
+**Version:** 1.3.1  
 **Converted from:** https://github.com/aws-samples/sample-kiro-rbui-agent  
 **License:** MIT-0
 
@@ -175,6 +175,19 @@ The script produces:
 | Review | Any time | ADVISORY items — verify manually, not counted |
 
 ## Changelog
+
+**1.3.1**
+- Category 7 (QT) now uses your account's real limits instead of hard-coded
+  defaults. Resolution order: `rds describe-account-attributes` (real Used +
+  Max) -> Service Quotas applied value -> Service Quotas AWS default ->
+  hard-coded default. Every line shows where the limit came from; a limit that
+  is only an assumed default is reported as ADVISORY ("UNVERIFIED default"),
+  never as OK. Thresholds are 90% of the real limit.
+- KT-01 / KT-04 read the KMS "Cryptographic operations (symmetric) request
+  rate" and "CreateGrant request rate" quotas by name. The previous quota code
+  returned an unrelated 1,000 req/s value, and failures silently fell back to
+  5,500.
+- IAM policy: added `service-quotas:ListAWSDefaultServiceQuotas`.
 
 **1.3.0**
 - New `ADVISORY` severity for generic, unverifiable items (FT-03, FT-06, KT-*,

@@ -23,7 +23,7 @@
 set -uo pipefail
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-RBUI_VERSION="1.3.0"
+RBUI_VERSION="1.3.1"
 AWS_REGION="${1:-us-east-1}"
 DR_REGION="${2:-${RBUI_DR_REGION:-}}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -44,6 +44,58 @@ trap 'rm -f "$RBUI_ERR_FILE" "$RBUI_FAILED_FILE"' EXIT
 
 # api_failed LABEL -> true if that collection call failed
 api_failed() { grep -qxF "$1" "$RBUI_FAILED_FILE" 2>/dev/null; }
+
+# Quota lookups (filled in collect_data)
+SQ_RDS="[]"; SQ_RDS_DEF="[]"; SQ_KMS="[]"; SQ_KMS_DEF="[]"
+SQ_VALUE=""; SQ_SRC=""; AQ_USED=""; AQ_MAX=""
+KMS_QUOTA=""; KMS_QUOTA_SRC=""; KMS_GRANT_QUOTA=""; KMS_GRANT_QUOTA_SRC=""
+
+# sq_lookup SERVICE(rds|kms) EXACT_NAME REGEX
+#   Finds a Service Quotas limit by exact name, or (if EXACT_NAME is empty /
+#   not found) by case-insensitive REGEX on the name. Applied account value
+#   wins over the AWS default. Sets SQ_VALUE (integer) and SQ_SRC
+#   ("account quota" | "AWS default" | "" when not found).
+sq_lookup() {
+  local svc="$1" exact="$2" rx="$3" applied defaults src v
+  if [[ "$svc" == "rds" ]]; then applied="$SQ_RDS"; defaults="$SQ_RDS_DEF"
+  else                           applied="$SQ_KMS"; defaults="$SQ_KMS_DEF"; fi
+  SQ_VALUE=""; SQ_SRC=""
+  for src in "account quota" "AWS default"; do
+    local data="$applied"; [[ "$src" == "AWS default" ]] && data="$defaults"
+    v=$(echo "$data" | jq -r --arg e "$exact" --arg r "$rx" '
+      ( [.[] | select($e != "" and .n == $e)]
+        + [.[] | select($r != "" and (.n | test($r; "i")))] )
+      | (.[0].v // empty) | floor' 2>/dev/null)
+    if [[ "$v" =~ ^[0-9]+$ ]]; then SQ_VALUE="$v"; SQ_SRC="$src"; return; fi
+  done
+}
+
+# acct_quota NAME -> sets AQ_USED / AQ_MAX from rds describe-account-attributes
+# (real per-account Used and Max). Empty if not returned.
+acct_quota() {
+  AQ_USED=$(echo "$ACCOUNT_ATTRS" | jq -r --arg n "$1" '[.AccountQuotas[]? | select(.AccountQuotaName == $n)][0].Used // empty' 2>/dev/null)
+  AQ_MAX=$(echo  "$ACCOUNT_ATTRS" | jq -r --arg n "$1" '[.AccountQuotas[]? | select(.AccountQuotaName == $n)][0].Max  // empty' 2>/dev/null)
+}
+
+# quota_check ID SEVERITY LABEL USED MAX SOURCE
+#   Flags SEVERITY when USED >= 90% of MAX, otherwise OK. Always shows where
+#   the limit came from so a hard-coded default is never mistaken for a fact.
+quota_check() {
+  local id="$1" sev="$2" label="$3" used="$4" max="$5" src="$6" pct
+  if ! [[ "$used" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]]; then
+    blocker "$id" MEDIUM "$label: usage/limit UNVERIFIED (used='${used:-?}', limit='${max:-?}')"
+    return
+  fi
+  pct=$(( used * 100 / max ))
+  if [[ "$pct" -ge 90 ]]; then
+    blocker "$id" "$sev" "$label: $used/$max (${pct}%, limit from $src) -- approaching limit; DR restores/copies fail once it is reached"
+  elif [[ "$src" == UNVERIFIED* ]]; then
+    # Can't call it OK when the limit itself is an assumption
+    advisory "$id" "$label: $used/$max (${pct}%) -- limit is an UNVERIFIED default (quota APIs unavailable or quota not listed); confirm the real value in the Service Quotas console"
+  else
+    ok "$label: $used/$max (${pct}%, limit from $src)"
+  fi
+}
 
 # Terminal colours
 RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
@@ -365,9 +417,18 @@ collect_data() {
   ACCOUNT_ATTRS=$(_aws "describe-account-attributes" rds describe-account-attributes --region "$AWS_REGION")
   echo "$ACCOUNT_ATTRS" | jq -e 'type == "array"' &>/dev/null && ACCOUNT_ATTRS='{"AccountQuotas":[]}'
 
-  KMS_QUOTA=$(aws service-quotas get-service-quota \
-    --service-code kms --quota-code L-2AC98190 \
-    --region "$AWS_REGION" --query 'Quota.Value' --output text 2>/dev/null || echo "5500")
+  # Service Quotas: applied (account) values + AWS defaults, matched by quota
+  # NAME (quota codes are opaque and easy to get wrong). [] on failure.
+  SQ_RDS=$(_aws     "list-service-quotas rds"              service-quotas list-service-quotas             --service-code rds --region "$AWS_REGION" --query 'Quotas[*].{n:QuotaName,v:Value}')
+  SQ_RDS_DEF=$(_aws "list-aws-default-service-quotas rds"  service-quotas list-aws-default-service-quotas --service-code rds --region "$AWS_REGION" --query 'Quotas[*].{n:QuotaName,v:Value}')
+  SQ_KMS=$(_aws     "list-service-quotas kms"              service-quotas list-service-quotas             --service-code kms --region "$AWS_REGION" --query 'Quotas[*].{n:QuotaName,v:Value}')
+  SQ_KMS_DEF=$(_aws "list-aws-default-service-quotas kms"  service-quotas list-aws-default-service-quotas --service-code kms --region "$AWS_REGION" --query 'Quotas[*].{n:QuotaName,v:Value}')
+
+  # KMS limits used by KT-01 / KT-04 (exact names from the KMS developer guide)
+  sq_lookup kms "Cryptographic operations (symmetric) request rate" ""
+  KMS_QUOTA="$SQ_VALUE";       KMS_QUOTA_SRC="$SQ_SRC"
+  sq_lookup kms "CreateGrant request rate" ""
+  KMS_GRANT_QUOTA="$SQ_VALUE"; KMS_GRANT_QUOTA_SRC="$SQ_SRC"
 
   INSTANCE_COUNT=$(echo "$RDS_INSTANCES" | jq 'length' 2>/dev/null || echo 0)
   CLUSTER_COUNT=$(echo  "$RDS_CLUSTERS"  | jq 'length' 2>/dev/null || echo 0)
@@ -632,10 +693,18 @@ check_kms_throttling() {
   enc_count=$(jq -n --argjson i "$RDS_INSTANCES" --argjson c "$RDS_CLUSTERS" '
     ([$i[] | select((.Engine | startswith("aurora")) | not) | select(.DBClusterIdentifier == null) | select(.StorageEncrypted == true)] | length)
     + ([$c[] | select(.StorageEncrypted == true)] | length)' 2>/dev/null || echo 0)
-  advisory "KT-01" "KMS cryptographic ops quota in $AWS_REGION: ${KMS_QUOTA} req/s, shared by $enc_count encrypted RDS/Aurora resource(s) -- parallel restores compete for this quota"
+  if [[ -n "$KMS_QUOTA" ]]; then
+    advisory "KT-01" "KMS symmetric cryptographic ops quota in $AWS_REGION: ${KMS_QUOTA} req/s (Service Quotas $KMS_QUOTA_SRC), shared by $enc_count encrypted RDS/Aurora resource(s) and all other KMS callers -- parallel restores compete for this quota"
+  else
+    advisory "KT-01" "KMS symmetric cryptographic ops quota in $AWS_REGION: UNVERIFIED (Service Quotas lookup failed) -- $enc_count encrypted RDS/Aurora resource(s); check 'Cryptographic operations (symmetric) request rate' in the Service Quotas console"
+  fi
   advisory "KT-02" "KMS request quotas are per account+region and SHARED across all services (RDS, S3, EBS, Lambda) -- DR-time contention possible; not measurable from config"
   advisory "KT-03" "Exceeding KMS quotas returns ThrottlingException -- test parallel encrypted restores in a DR drill to confirm they don't stall"
-  advisory "KT-04" "KMS CreateGrant is rate-limited -- encrypted RDS creates/restores consume grants; stagger fleet-wide restores in the runbook"
+  if [[ -n "$KMS_GRANT_QUOTA" ]]; then
+    advisory "KT-04" "KMS CreateGrant quota in $AWS_REGION: ${KMS_GRANT_QUOTA} req/s (Service Quotas $KMS_GRANT_QUOTA_SRC) -- encrypted RDS creates/restores consume grants; stagger fleet-wide restores in the runbook"
+  else
+    advisory "KT-04" "KMS CreateGrant quota in $AWS_REGION: UNVERIFIED (Service Quotas lookup failed; AWS documented default is 50 req/s) -- stagger fleet-wide encrypted restores"
+  fi
 }
 
 # =============================================================================
@@ -727,34 +796,48 @@ check_account_quotas() {
   html_section_open "qt" "Category 7: Account-Level Service Quotas (QT)"
   header "Category 7: Account-Level Service Quotas (QT)"
 
-  local snap_count isnap_count gc_count proxy_count
+  # Limit resolution order (first hit wins):
+  #   1. rds describe-account-attributes  -> real Used AND Max for this account
+  #   2. Service Quotas applied value      -> real account limit (usage counted)
+  #   3. Service Quotas AWS default        -> documented default (usage counted)
+  #   4. hard-coded default                -> labelled "UNVERIFIED default"
+  rds_quota() {
+    local id="$1" sev="$2" label="$3" attr="$4" used_fallback="$5" sq_rx="$6" def="$7"
+    local used="" max="" src=""
+    if [[ -n "$attr" ]]; then
+      acct_quota "$attr"
+      if [[ -n "$AQ_MAX" ]]; then used="$AQ_USED"; max="$AQ_MAX"; src="account (describe-account-attributes)"; fi
+    fi
+    if [[ -z "$max" ]]; then
+      used="$used_fallback"
+      sq_lookup rds "" "$sq_rx"
+      if [[ -n "$SQ_VALUE" ]]; then max="$SQ_VALUE"; src="Service Quotas $SQ_SRC"
+      else                          max="$def";      src="UNVERIFIED default"; fi
+    fi
+    quota_check "$id" "$sev" "$label" "$used" "$max" "$src"
+  }
 
+  local snap_count isnap_count gc_count proxy_count
   snap_count=$(echo "$CLUSTER_SNAPSHOTS"  | jq 'length' 2>/dev/null || echo 0)
   isnap_count=$(echo "$INSTANCE_SNAPSHOTS" | jq 'length' 2>/dev/null || echo 0)
   gc_count=$(echo "$GLOBAL_CLUSTERS"      | jq 'length' 2>/dev/null || echo 0)
   proxy_count=$(echo "$PROXIES"           | jq 'length' 2>/dev/null || echo 0)
+  # A failed list call means usage is unknown, not zero
+  api_failed "describe-db-cluster-snapshots" && snap_count=""
+  api_failed "describe-db-snapshots"         && isnap_count=""
+  api_failed "describe-global-clusters"      && gc_count=""
+  api_failed "describe-db-proxies"           && proxy_count=""
 
-  if [[ "$snap_count"   -ge 90 ]]; then blocker "QT-01" HIGH "Manual cluster snapshots: $snap_count/100 -- approaching limit. DR copies will fail when limit is hit."
-  else ok "Manual cluster snapshots: $snap_count/100"; fi
+  rds_quota "QT-01" HIGH     "Manual cluster snapshots"  "ManualClusterSnapshots" "$snap_count"     '^manual (db )?cluster snapshots'          100
+  rds_quota "QT-02" HIGH     "Manual instance snapshots" "ManualSnapshots"        "$isnap_count"    '^manual (db )?(instance )?snapshots$'     100
+  rds_quota "QT-03" CRITICAL "DB instances (RDS+Aurora+Neptune+DocumentDB)" "DBInstances" "$INSTANCE_COUNT" '^db instances$'          40
+  rds_quota "QT-04" CRITICAL "DB clusters"               "DBClusters"             "$CLUSTER_COUNT"  '^db clusters$'                            40
+  rds_quota "QT-10" MEDIUM   "Aurora Global Databases"   ""                       "$gc_count"       'global (databases|clusters|db)'           5
+  rds_quota "QT-19" MEDIUM   "RDS Proxies"               ""                       "$proxy_count"    '^(rds )?(db )?prox(y|ies)$'               20
 
-  if [[ "$isnap_count"  -ge 90 ]]; then blocker "QT-02" HIGH "Manual instance snapshots: $isnap_count/100 -- approaching limit."
-  else ok "Manual instance snapshots: $isnap_count/100"; fi
-
-  if [[ "$INSTANCE_COUNT" -ge 36 ]]; then blocker "QT-03" CRITICAL "DB instances: $INSTANCE_COUNT/40 -- approaching regional limit. DR restore WILL FAIL when limit is reached."
-  else ok "DB instances: $INSTANCE_COUNT/40"; fi
-
-  if [[ "$CLUSTER_COUNT"  -ge 36 ]]; then blocker "QT-04" CRITICAL "DB clusters: $CLUSTER_COUNT/40 -- approaching regional limit."
-  else ok "DB clusters: $CLUSTER_COUNT/40"; fi
-
+  # Not exposed by any quota API -- documented limit
   advisory "QT-07" "Concurrent cross-region snapshot copies are limited (5 per destination region) -- multiple simultaneous DR copies queue and delay recovery"
-
-  if [[ "$gc_count"     -ge 5  ]]; then blocker "QT-10" MEDIUM "Aurora Global Databases: $gc_count/5 -- at regional limit."
-  else ok "Aurora Global Databases: $gc_count/5"; fi
-
   # QT-15 (KMS CreateGrant) is covered by KT-04 -- not reported twice
-
-  if [[ "$proxy_count"  -ge 18 ]]; then blocker "QT-19" MEDIUM "RDS Proxies: $proxy_count/20 -- approaching limit."
-  else ok "RDS Proxies: $proxy_count/20"; fi
 }
 
 # =============================================================================

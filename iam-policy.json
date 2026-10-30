@@ -16,6 +16,7 @@
         "kms:ListAliases",
         "service-quotas:GetServiceQuota",
         "service-quotas:ListServiceQuotas",
+        "service-quotas:ListAWSDefaultServiceQuotas",
         "sts:GetCallerIdentity"
       ],
       "Resource": "*"
